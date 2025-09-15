@@ -107,6 +107,7 @@ mutual
     | sConst  : SpecConst → STerm
     | bvar    : Nat → STerm                      -- De bruijin index
     | qIdApp  : QualIdent → Array STerm → STerm  -- Application of function symbol to array of terms
+    | testerApp : String → STerm → STerm         -- Application of a datatype tester of the form `(_ is ctor)` to a term
     | letE    : (name : String) → (binding : STerm) → (body : STerm) → STerm
     | forallE : (name : String) → (binderType : SSort) → (body : STerm) → STerm
     | existE  : (name : String) → (binderType : SSort) → (body : STerm) → STerm
@@ -155,6 +156,8 @@ private partial def STerm.toStringAux : STerm → List SIdent → String
     let intro := s!"({si} "
     let tail := String.intercalate " " (STerm.toStringAux a binders :: goQIdApp as binders)
     intro ++ tail ++ ")"
+  | .testerApp ctorName s, binders =>
+    "((_ is " ++ ctorName ++ ") " ++ (STerm.toStringAux s binders) ++ ")"
   | .letE name binding body, binders =>
     let binders := (SIdent.symb name) :: binders
     let intro := s!"(let ({SIdent.symb name} "
@@ -228,7 +231,7 @@ structure ConstrDecl where
   name     : String
   selDecls : Array (String × SSort)
 
-private def ConstrDecl.toString : ConstrDecl → Array SIdent → String
+def ConstrDecl.toString : ConstrDecl → Array SIdent → String
 | ⟨name, selDecls⟩, binders =>
   let pre := s!"({SIdent.symb name}"
   let selDecls := selDecls.map (fun (name, sort) => s!"({SIdent.symb name} " ++ SSort.toString sort binders ++ ")")
@@ -241,7 +244,7 @@ structure DatatypeDecl where
   params : Array String
   cstrDecls : Array ConstrDecl
 
-private def DatatypeDecl.toString : DatatypeDecl → String := fun ⟨params, cstrDecls⟩ =>
+def DatatypeDecl.toString : DatatypeDecl → String := fun ⟨params, cstrDecls⟩ =>
   let scstrDecls := cstrDecls.map (fun d => ConstrDecl.toString d (params.map SIdent.symb))
   let scstrDecls := "(" ++ String.intercalate " " scstrDecls.toList ++ ")"
   if params.size == 0 then
@@ -298,6 +301,7 @@ instance : ToString SMTOption where
                 ( declare-sort 〈symbol〉 〈numeral〉 )
                 ( define-fun 〈function_def〉 )
                 ( define-fun-rec 〈function_def〉 )
+                ( define-funs-rec ( ⟨function_dec⟩ⁿ⁺¹ ) ( ⟨term⟩ⁿ⁺¹ ) )
                 ( define-sort 〈symbol〉 ( 〈symbol〉∗ ) 〈sort〉 )
                 ( declare-datatype 〈symbol〉 〈datatype_dec〉)
                 ...
@@ -324,12 +328,19 @@ inductive Command where
   | declSort   : (name : String) → (arity : Nat) → Command
   | defFun     : (isRec : Bool) → (name : String) → (args : Array (String × SSort)) →
                    (resTy : SSort) → (body : STerm) → Command
+  -- `defFuns` is used for the command `define-funs-rec`. Each element in the array it takes in contains:
+  -- `String` : Function name
+  -- `Array (String × SSort)` : Function args
+  -- `SSort` : Function return sort
+  -- `STerm` : Function body
+  | defFuns    : Array (String × Array (String × SSort) × SSort × STerm) → Command
   | defSort    : (name : String) → (args : Array String) → (body : SSort) → Command
   | declDtype  : (name : String) → DatatypeDecl → Command
   -- String × Nat : sort_dec
   -- String : Name of datatype
   -- Nat    : Number of parameters of the datatype
   | declDtypes : Array (String × Nat × DatatypeDecl) → Command
+  | echo       : String → Command
   | exit       : Command
 
 def Command.toString : Command → String
@@ -354,6 +365,15 @@ def Command.toString : Command → String
   let binders := "(" ++ String.intercalate " " (args.map (fun (name, sort) => s!"({SIdent.symb name} {sort})")).toList ++ ") "
   let trail := s!"{resTy} " ++ STerm.toString body (args.map (fun (name, _) => SIdent.symb name)) ++ ")"
   pre ++ binders ++ trail
+| .defFuns defs =>
+  let pre := "(define-funs-rec "
+  let declStringOfDef : String × Array (String × SSort) × SSort × STerm → String := fun (name, args, resSort, _) =>
+    let argBinders := "(" ++ String.intercalate " " (args.map (fun (name, sort) => s!"({SIdent.symb name} {sort})")).toList ++ ") "
+    s!"({SIdent.symb name} {argBinders} {resSort})"
+  let decls := "(" ++ String.intercalate " " (defs.map declStringOfDef).toList ++ ") "
+  let bodies := "(" ++ String.intercalate " " (defs.map (fun (_, args, _, body) => STerm.toString body (args.map (fun (name, _) => SIdent.symb name)))).toList ++ ")"
+  let trail := ")"
+  pre ++ decls ++ bodies ++ trail
 | .defSort name args body              =>
   let pre := s!"(define-sort {SIdent.symb name} ("
   let sargs := String.intercalate " " args.toList ++ ") "
@@ -365,6 +385,7 @@ def Command.toString : Command → String
   let sort_decs := String.intercalate " " (infos.toList.map (fun (name, args, _) => s!"({SIdent.symb name} {args})"))
   let datatype_decs := String.intercalate " " (infos.toList.map (fun (_, _, ddecl) => ddecl.toString))
   s!"(declare-datatypes ({sort_decs}) ({datatype_decs}))"
+| .echo s                              => s!"(echo \"{s}\")"
 | .exit                                => "(exit)"
 
 instance : ToString Command where
@@ -374,6 +395,8 @@ section
 
   -- Type of (identifiers in higher-level logic)
   variable (ω : Type) [BEq ω] [Hashable ω]
+  -- Type of (sorts in higher-level logic)
+  variable (φ : Type) [BEq φ] [Hashable φ]
 
   /--
     The main purpose of this state is for name generation
@@ -401,41 +424,47 @@ section
     --   been used for `k` times (`k > 0`), return `n' ++ s!"_{k - 1}"`.
     -- `usedNames` records the `k - 1` for each `n'`
     usedNames : Std.HashMap String Nat := {}
+    -- Map from SMT sorts to the names of their corresponding well-formed predicates.
+    -- If an SMT sort's well-formed predicate would be equivalent to `True`, no
+    -- well-formed predicate needs to be created, so `wfPredicatesMap` maps that sort
+    -- to `none`
+    wfPredicatesMap : Std.HashMap φ (Option String) := {}
+    -- Inverse of `wfPredicates`
+    wfPredicatesInvMap : Std.HashMap String φ := {}
     -- List of commands
     commands  : Array Command      := #[]
 
-  abbrev TransM := StateRefT (State ω) MetaM
-
-  variable {ω : Type} [BEq ω] [Hashable ω]
+  abbrev TransM := StateRefT (State ω φ) MetaM
 
   @[always_inline]
-  instance : Monad (TransM ω) :=
-    let i := inferInstanceAs (Monad (TransM ω));
+  instance : Monad (TransM ω φ) :=
+    let i := inferInstanceAs (Monad (TransM ω φ));
     { pure := i.pure, bind := i.bind }
 
-  instance : Inhabited (TransM ω α) where
+  instance : Inhabited (TransM ω φ α) where
     default := fun _ => throw default
 
   variable {ω : Type} [BEq ω] [Hashable ω] [ToString ω]
+  variable {φ : Type} [BEq φ] [Hashable φ] [ToString φ]
 
-  @[inline] def TransM.run (x : TransM ω α) (s : State ω := {}) : MetaM (α × State ω) :=
+  @[inline] def TransM.run (x : TransM ω φ α) (s : State ω φ := {}) : MetaM (α × State ω φ) :=
     StateRefT'.run x s
 
-  @[inline] def TransM.run' (x : TransM ω α) (s : State ω := {}) : MetaM α :=
+  @[inline] def TransM.run' (x : TransM ω φ α) (s : State ω φ := {}) : MetaM α :=
     Prod.fst <$> StateRefT'.run x s
 
-  #genMonadState (TransM ω)
+  #genMonadState (TransM ω φ)
 
-  def getMapSize : TransM ω Nat := do
+  def getMapSize : TransM ω φ Nat := do
     let size := (← getH2lMap).size
     assert! ((← getL2hMap).size == size)
     return size
 
-  def hIn (e : ω) : TransM ω Bool := do
+  def hIn (e : ω) : TransM ω φ Bool := do
     return (← getH2lMap).contains e
 
   /- Note that this function will add the processed name to `usedNames` -/
-  def processSuggestedName (nameSuggestion : String) : TransM ω String := do
+  def processSuggestedName (nameSuggestion : String) : TransM ω φ String := do
     let mut preName := nameSuggestion.map (fun c => if allowed c then c else '_')
     if preName.all (fun c => c == '_') then
       preName := "pl_" ++ preName
@@ -460,13 +489,14 @@ section
 
 
   /- Generate names that does not correspond to high-level construct -/
-  partial def disposableName (nameSuggestion : String) : TransM ω String := processSuggestedName nameSuggestion
+  partial def disposableName (nameSuggestion : String) : TransM ω φ String := processSuggestedName nameSuggestion
 
   /--
     Turn high-level construct into low-level symbol
     Note that this function is idempotent
   -/
-  partial def h2Symb (cstr : ω) (nameSuggestion : Option String) : TransM ω String := do
+  partial def h2Symb (cstr : ω) (nameSuggestion : Option String) : TransM ω φ String := do
+    trace[auto.lamFOL2SMT] "Calling h2Symb on {cstr} with nameSuggestion {nameSuggestion}"
     let l2hMap ← getL2hMap
     let h2lMap ← getH2lMap
     if let .some name := h2lMap.get? cstr then
@@ -478,7 +508,21 @@ section
     setH2lMap (h2lMap.insert cstr name)
     return name
 
-  def addCommand (c : Command) : TransM ω Unit := do
+  /-- Like `hySymb` but produces names for well-formed predicates of sort `s` (of type `φ`) rather than of
+      constructs (of type `ω`) -/
+  partial def h2SymbWf (s : φ) (nameSuggestion : Option String) : TransM ω φ (Option String) := do
+    let wfPredicatesMap ← getWfPredicatesMap
+    let wfPredicatesInvMap ← getWfPredicatesInvMap
+    if let some name := wfPredicatesMap.get? s then
+      return name
+    let .some nameSuggestion := nameSuggestion
+      | throwError "{decl_name%} :: Fresh well-formed predicate for {s} without name suggestion"
+    let name ← processSuggestedName nameSuggestion
+    setWfPredicatesInvMap (wfPredicatesInvMap.insert name s)
+    setWfPredicatesMap (wfPredicatesMap.insert s name)
+    return name
+
+  def addCommand (c : Command) : TransM ω φ Unit := do
     let commands ← getCommands
     setCommands (commands.push c)
 
