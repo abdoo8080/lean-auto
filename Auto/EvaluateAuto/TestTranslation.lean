@@ -104,7 +104,7 @@ where analyzeLine (line : String) : CoreM (Name × Nat × Option Nat) := do
   let .some rawSize := rawSizeStr.toNat?
     | throwError "{decl_name%} :: {rawSizeStr} is not a string representation of a Nat"
   let monoSizeStr := line.takeWhile (fun c => c != ' ')
-  let line := (line.dropWhile (fun c => c != ' ')).drop 1
+  let line := ((line.dropWhile (fun c => c != ' ')).drop 1).toString
   let mut monoSize? : Option Nat := .none
   if monoSizeStr != "N" then
     let .some monoSize := monoSizeStr.toNat?
